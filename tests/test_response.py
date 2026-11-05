@@ -82,3 +82,19 @@ def test_update_from():
     assert response.status_code == 202
     assert response.headers.get("X-Foo") == "Bar"
     assert response.content_type == "application/octet-stream"
+
+
+def test_trailers():
+    response = Response("body")
+    assert len(response.trailers) == 0
+    response.trailers["x-trailer"] = "value"
+    assert response.trailers["x-trailer"] == "value"
+
+
+def test_update_from_shares_trailers():
+    source = Response("body")
+    target = Response()
+    target.update_from(source)
+    # added after the update, as when relaying a response whose trailers arrive with its end
+    source.trailers["x-trailer"] = "value"
+    assert target.trailers["x-trailer"] == "value"

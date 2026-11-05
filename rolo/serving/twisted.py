@@ -40,7 +40,9 @@ from rolo.websocket import (
 )
 
 if H2_ENABLED:
-    from twisted.web._http2 import H2Connection
+    from twisted.web._http2 import H2Stream
+
+    from rolo.serving.h2 import StreamingH2Connection
 
 if t.TYPE_CHECKING:
     from _typeshed.wsgi import WSGIEnvironment
@@ -92,6 +94,22 @@ def update_wsgi_environment(environ: "WSGIEnvironment", request: TwistedRequest)
     addr = request.getClientAddress()
     environ["REMOTE_ADDR"] = addr.host
     environ["REMOTE_PORT"] = str(addr.port)
+
+    if (
+        H2_ENABLED
+        and request.method != b"HEAD"
+        and isinstance(stream := request.channel, H2Stream)
+        and isinstance(stream._conn, StreamingH2Connection)
+    ):
+        # the trailers that end an HTTP/2 response (see ``rolo.gateway.wsgi``), set in the reactor thread
+        def send_trailers(trailers: t.Iterable[tuple[str | bytes, str | bytes]]) -> None:
+            reactor.callFromThread(
+                stream._conn.setTrailers,
+                stream.streamID,
+                [(_latin1(key).lower(), _latin1(value)) for key, value in trailers],
+            )
+
+        environ["rolo.send_trailers"] = send_trailers
 
 
 def to_websocket_environment(request: Request) -> WebSocketEnvironment:
@@ -204,8 +222,12 @@ class TwistedRequestHeaderAdapter(TwistedHeaderAdapter):
         self._caseMappings.pop(_encode_header_name(name).lower(), None)
 
 
+def _latin1(value: Union[str, bytes]) -> bytes:
+    return value.encode("latin-1") if isinstance(value, str) else value
+
+
 def _encode_header_name(name: Union[str, bytes]) -> bytes:
-    return name.encode("latin-1") if isinstance(name, str) else name
+    return _latin1(name)
 
 
 class TwistedRequestAdapter(TwistedRequest):
@@ -243,8 +265,15 @@ class PriorKnowledgeHTTPChannelProtocol(_GenericHTTPChannelProtocol):
         if self._negotiatedProtocol is not None:
             return self._channel.dataReceived(data)
 
-        if getattr(self._channel.transport, "negotiatedProtocol", None) is not None:
-            # a protocol was negotiated via ALPN (or by a wrapping transport), which twisted handles
+        negotiatedProtocol = getattr(self._channel.transport, "negotiatedProtocol", None)
+        if negotiatedProtocol == b"h2":
+            # negotiated via ALPN: twisted would switch to a plain ``H2Connection``
+            if not H2_ENABLED:
+                raise ValueError("Negotiated HTTP/2 without support.")
+            self._switchToH2()
+            return self._channel.dataReceived(data)
+        if negotiatedProtocol is not None:
+            # another protocol was negotiated via ALPN (or by a wrapping transport), which twisted handles
             return super().dataReceived(data)
 
         # the preface may arrive in fragments, so we buffer until we can tell whether this is the preface
@@ -263,8 +292,9 @@ class PriorKnowledgeHTTPChannelProtocol(_GenericHTTPChannelProtocol):
 
     def _switchToH2(self):
         """
-        Replaces the HTTP/1 channel with an ``H2Connection``, the same way
-        ``_GenericHTTPChannelProtocol.dataReceived`` does when ALPN negotiated ``h2``.
+        Replaces the HTTP/1 channel with a ``StreamingH2Connection``, the same way
+        ``_GenericHTTPChannelProtocol.dataReceived`` switches to a plain ``H2Connection`` when ALPN negotiated
+        ``h2``.
         """
         if not H2_ENABLED:
             raise ValueError("Received HTTP/2 connection preface without HTTP/2 support.")
@@ -277,7 +307,7 @@ class PriorKnowledgeHTTPChannelProtocol(_GenericHTTPChannelProtocol):
         self._channel.setTimeout(None)
 
         transport = self._channel.transport
-        self._channel = H2Connection()
+        self._channel = StreamingH2Connection()
         self._channel.requestFactory = self._requestFactory
         self._channel.site = self._site
         self._channel.factory = self._factory

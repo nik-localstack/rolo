@@ -4,6 +4,7 @@ import typing as t
 
 from werkzeug.datastructures import Headers, MultiDict
 from werkzeug.wrappers import Request
+from werkzeug.wsgi import ClosingIterator
 
 from rolo.response import Response
 
@@ -67,4 +68,13 @@ class WsgiGateway:
 
         self.gateway.process(request, response)
 
-        return response(environ, start_response)
+        app_iter = response(environ, start_response)
+        if send_trailers := environ.get("rolo.send_trailers"):
+
+            def end_with_trailers():
+                if response.trailers:
+                    send_trailers(response.trailers.items())
+
+            # the server closes the body once it is exhausted, before it ends the response
+            return ClosingIterator(app_iter, end_with_trailers)
+        return app_iter

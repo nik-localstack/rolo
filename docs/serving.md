@@ -51,7 +51,7 @@ Similar to the previous example, you can serve the `app` object through any WSGI
 ASGI
 ----
 
-ASGI servers like Hypercorn allow asynchronous server communication, which is needed for HTTP/2 streaming or Websockets.
+ASGI servers like Hypercorn allow asynchronous server communication, for example for Websockets.
 Gateways can be served through the `AsgiGateway` adapter, which exposes a `Gateway` as an ASGI3 application.
 Under the hood, it uses our own ASGI/WSGI bridge (`AsgiAdapter`), and converts ASGI calls to WSGI calls for regular HTTP requests, and uses ASGI websockets for serving rolo websockets.
 File `myapp.py`:
@@ -93,3 +93,35 @@ endpoint.listen(site)
 
 reactor.run()
 ```
+
+### HTTP/2 streaming and trailers
+
+With HTTP/2 support installed (`pip install twisted[http2]`), the Twisted server dispatches an HTTP/2 request as soon as its headers arrive.
+The handler reads the request body from `request.stream` while the client is still sending it, and the response body is sent as it is produced, so a single request can stream in both directions.
+A handler that reads slowly slows the client down through HTTP/2 flow control.
+Each open stream holds a thread of the server's thread pool while its handler runs.
+A read of the request body raises a `TimeoutError` once the stream was silent in both directions for the site's `timeOut`, so a stream waiting on a silent client releases its thread.
+
+A response can also end with trailers, set on `Response.trailers`.
+They are sent once the response body is exhausted, so they can still be added while the body is produced:
+
+```python
+from rolo import Request, Response, route
+
+
+@route("/echo", methods=["POST"])
+def echo(request: Request):
+    response = Response(mimetype="application/octet-stream")
+
+    def body():
+        total = 0
+        while chunk := request.stream.read(65536):
+            total += len(chunk)
+            yield chunk
+        response.trailers["x-echo-bytes"] = str(total)
+
+    response.response = body()
+    return response
+```
+
+Trailers are only sent by the Twisted server over HTTP/2; other servers and HTTP/1.1 responses ignore them.

@@ -3,6 +3,7 @@ import mimetypes
 import typing as t
 from importlib import resources
 
+from werkzeug.datastructures import Headers
 from werkzeug.exceptions import NotFound
 from werkzeug.wrappers import Response as WerkzeugResponse
 
@@ -42,6 +43,14 @@ class Response(WerkzeugResponse):
     An HTTP Response object, which simply extends werkzeug's Response object with a few convenience methods.
     """
 
+    trailers: Headers
+    """Trailers that end the response, sent once the body is exhausted, which only the twisted server does, over
+    HTTP/2. They may be added while the body is iterated (e.g., when relaying a response that has trailers)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.trailers = Headers()
+
     def update_from(self, other: WerkzeugResponse):
         """
         Updates this response object with the data from the given response object. It reads the status code,
@@ -54,6 +63,9 @@ class Response(WerkzeugResponse):
         self.response = other.response
         self._on_close.extend(other._on_close)
         self.headers.update(other.headers)
+        if (trailers := getattr(other, "trailers", None)) is not None:
+            # shared, so trailers added while the body is iterated still end the response
+            self.trailers = trailers
 
     def set_json(self, doc: t.Any, cls: t.Type[json.JSONEncoder] = None):
         """
